@@ -28,15 +28,15 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/informers"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	storageinformers "k8s.io/client-go/informers/storage/v1"
-	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/component-helpers/storage/volume"
@@ -44,7 +44,6 @@ import (
 	"k8s.io/klog/v2/ktesting"
 	_ "k8s.io/klog/v2/ktesting/init"
 	"k8s.io/kubernetes/pkg/controller"
-	pvtesting "k8s.io/kubernetes/pkg/controller/volume/persistentvolume/testing"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
 )
 
@@ -132,8 +131,7 @@ var (
 )
 
 type testEnv struct {
-	client                  clientset.Interface
-	reactor                 *pvtesting.VolumeReactor
+	client                  *fake.Clientset
 	binder                  SchedulerVolumeBinder
 	internalBinder          *volumeBinder
 	internalPodInformer     coreinformers.PodInformer
@@ -146,19 +144,46 @@ type testEnv struct {
 }
 
 func newTestBinder(t *testing.T, ctx context.Context) *testEnv {
-	client := &fake.Clientset{}
-	logger := klog.FromContext(ctx)
-	reactor := pvtesting.NewVolumeReactor(ctx, client, nil, nil, nil)
-	// TODO refactor all tests to use real watch mechanism, see #72327
-	client.AddWatchReactor("*", func(action k8stesting.Action) (handled bool, ret watch.Interface, err error) {
-		gvr := action.GetResource()
-		ns := action.GetNamespace()
-		watch, err := reactor.Watch(gvr, ns)
-		if err != nil {
-			return false, nil, err
+	client := fake.NewSimpleClientset()
+	// The fake tracker does not enforce resource version conflicts like the API server.
+	client.PrependReactor("update", "*", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		updateAction, ok := action.(k8stesting.UpdateAction)
+		if !ok {
+			return false, nil, nil
 		}
-		return true, watch, nil
+
+		obj, ok := updateAction.GetObject().(metav1.Object)
+		if !ok {
+			return false, nil, nil
+		}
+
+		current, err := client.Tracker().Get(
+			action.GetResource(),
+			action.GetNamespace(),
+			obj.GetName(),
+		)
+		if err != nil {
+			return true, nil, err
+		}
+
+		currentObj, ok := current.(metav1.Object)
+		if !ok {
+			return true, nil, fmt.Errorf("unexpected object type in fake tracker")
+		}
+
+		if currentObj.GetResourceVersion() != obj.GetResourceVersion() {
+			return true, nil, apierrors.NewConflict(
+				action.GetResource().GroupResource(),
+				obj.GetName(),
+				fmt.Errorf("resource version must match the object being updated"),
+			)
+		}
+
+		return false, nil, nil
 	})
+
+	logger := klog.FromContext(ctx)
+	// TODO refactor all tests to use real watch mechanism, see #72327
 	informerFactory := informers.NewSharedInformerFactory(client, controller.NoResyncPeriodFunc())
 
 	podInformer := informerFactory.Core().V1().Pods()
@@ -263,7 +288,6 @@ func newTestBinder(t *testing.T, ctx context.Context) *testEnv {
 
 	return &testEnv{
 		client:                  client,
-		reactor:                 reactor,
 		binder:                  binder,
 		internalBinder:          internalBinder,
 		internalPodInformer:     podInformer,
@@ -307,11 +331,15 @@ func (env *testEnv) initClaims(t *testing.T, cachedPVCs []*v1.PersistentVolumeCl
 			t.Fatalf("error adding PVC %s/%s to cache: %v", pvc.Namespace, pvc.Name, err)
 		}
 		if apiPVCs == nil {
-			env.reactor.AddClaim(pvc)
+			if err := env.client.Tracker().Add(pvc.DeepCopy()); err != nil {
+				t.Fatalf("failed to add PVC %s/%s to fake API: %v", pvc.Namespace, pvc.Name, err)
+			}
 		}
 	}
 	for _, pvc := range apiPVCs {
-		env.reactor.AddClaim(pvc)
+		if err := env.client.Tracker().Add(pvc.DeepCopy()); err != nil {
+			t.Fatalf("failed to add PVC %s/%s to fake API: %v", pvc.Namespace, pvc.Name, err)
+		}
 	}
 }
 
@@ -321,11 +349,17 @@ func (env *testEnv) initVolumes(t *testing.T, cachedPVs []*v1.PersistentVolume, 
 			t.Fatalf("error adding PV %s to cache: %v", pv.Name, err)
 		}
 		if apiPVs == nil {
-			env.reactor.AddVolume(pv)
+			if err := env.client.Tracker().Add(pv.DeepCopy()); err != nil {
+				t.Fatalf("failed to add PV %q to fake API: %v", pv.Name,
+					err)
+			}
 		}
 	}
 	for _, pv := range apiPVs {
-		env.reactor.AddVolume(pv)
+		if err := env.client.Tracker().Add(pv.DeepCopy()); err != nil {
+			t.Fatalf("failed to add PV %q to fake API: %v", pv.Name,
+				err)
+		}
 	}
 }
 
@@ -371,6 +405,79 @@ func (env *testEnv) updateClaims(ctx context.Context, pvcs []*v1.PersistentVolum
 		}
 		return true, nil
 	})
+}
+
+func (env *testEnv) checkVolumes(ctx context.Context, expectedVolumes []*v1.PersistentVolume) error {
+	actualList, err := env.client.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
+
+	if err != nil {
+		return fmt.Errorf("failed to list PVs from fake API: %w", err)
+	}
+
+	expectedMap := make(map[string]*v1.PersistentVolume, len(expectedVolumes))
+	actualMap := make(map[string]*v1.PersistentVolume, len(actualList.Items))
+
+	for _, volume := range expectedVolumes {
+		volumeCopy := volume.DeepCopy()
+		volumeCopy.ResourceVersion = ""
+
+		if volumeCopy.Spec.ClaimRef != nil {
+			volumeCopy.Spec.ClaimRef.ResourceVersion = ""
+		}
+
+		expectedMap[volumeCopy.Name] = volumeCopy
+	}
+
+	for i := range actualList.Items {
+		volumeCopy := actualList.Items[i].DeepCopy()
+		volumeCopy.ResourceVersion = ""
+
+		if volumeCopy.Spec.ClaimRef != nil {
+			volumeCopy.Spec.ClaimRef.ResourceVersion = ""
+		}
+
+		actualMap[volumeCopy.Name] = volumeCopy
+	}
+
+	if diff := cmp.Diff(expectedMap, actualMap); diff != "" {
+		return fmt.Errorf("PV check failed (-want, +got):\n%s",
+			diff)
+	}
+
+	return nil
+}
+
+func (env *testEnv) checkClaims(ctx context.Context, expectedClaims []*v1.PersistentVolumeClaim) error {
+	actualList, err := env.client.CoreV1().PersistentVolumeClaims(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
+
+	if err != nil {
+		return fmt.Errorf("failed to list PVCs from fake API: %w", err)
+	}
+
+	expectedMap := make(map[string]*v1.PersistentVolumeClaim, len(expectedClaims))
+	actualMap := make(map[string]*v1.PersistentVolumeClaim, len(actualList.Items))
+
+	for _, claim := range expectedClaims {
+		claimCopy := claim.DeepCopy()
+		claimCopy.ResourceVersion = ""
+
+		key := claimCopy.Namespace + "/" + claimCopy.Name
+		expectedMap[key] = claimCopy
+	}
+
+	for i := range actualList.Items {
+		claimCopy := actualList.Items[i].DeepCopy()
+		claimCopy.ResourceVersion = ""
+
+		key := claimCopy.Namespace + "/" + claimCopy.Name
+		actualMap[key] = claimCopy
+	}
+
+	if diff := cmp.Diff(expectedMap, actualMap); diff != "" {
+		return fmt.Errorf("PVC check failed (-want, +got):\n%s", diff)
+	}
+
+	return nil
 }
 
 func (env *testEnv) deleteVolumes(t *testing.T, pvs []*v1.PersistentVolume) {
@@ -517,6 +624,7 @@ func (env *testEnv) validateCacheRestored(t *testing.T, pod *v1.Pod, bindings []
 }
 
 func (env *testEnv) validateBind(
+	ctx context.Context,
 	t *testing.T,
 	pod *v1.Pod,
 	expectedPVs []*v1.PersistentVolume,
@@ -537,13 +645,14 @@ func (env *testEnv) validateBind(
 		}
 	}
 
-	// Check reactor for API updates
-	if err := env.reactor.CheckVolumes(expectedAPIPVs); err != nil {
-		t.Errorf("API reactor validation failed: %v", err)
+	// Check fake API for updates
+	if err := env.checkVolumes(ctx, expectedAPIPVs); err != nil {
+		t.Errorf("fake API validation failed: %v", err)
 	}
 }
 
 func (env *testEnv) validateProvision(
+	ctx context.Context,
 	t *testing.T,
 	pod *v1.Pod,
 	expectedPVCs []*v1.PersistentVolumeClaim,
@@ -564,9 +673,9 @@ func (env *testEnv) validateProvision(
 		}
 	}
 
-	// Check reactor for API updates
-	if err := env.reactor.CheckClaims(expectedAPIPVCs); err != nil {
-		t.Errorf("API reactor validation failed: %v", err)
+	// Check fake API for updates
+	if err := env.checkClaims(ctx, expectedAPIPVCs); err != nil {
+		t.Errorf("fake API validation failed: %v", err)
 	}
 }
 
@@ -1555,8 +1664,8 @@ func TestBindAPIUpdate(t *testing.T) {
 		if scenario.expectedAPIPVCs == nil {
 			scenario.expectedAPIPVCs = scenario.expectedPVCs
 		}
-		testEnv.validateBind(t, pod, scenario.expectedPVs, scenario.expectedAPIPVs)
-		testEnv.validateProvision(t, pod, scenario.expectedPVCs, scenario.expectedAPIPVCs)
+		testEnv.validateBind(ctx, t, pod, scenario.expectedPVs, scenario.expectedAPIPVs)
+		testEnv.validateProvision(ctx, t, pod, scenario.expectedPVCs, scenario.expectedAPIPVCs)
 	}
 
 	for name, scenario := range scenarios {
